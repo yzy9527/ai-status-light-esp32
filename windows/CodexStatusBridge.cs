@@ -883,6 +883,79 @@ namespace CodexStatusLight
             if (File.Exists(path)) File.Delete(path);
         }
 
+        private static void RunSessionCleanupSelfTest(string outputDirectory)
+        {
+            string testRoot = Path.Combine(outputDirectory,
+                "status-light-session-test-" + Guid.NewGuid().ToString("N"));
+            string sessions = Path.Combine(testRoot, "sessions");
+            string archive = Path.Combine(testRoot, "archived_sessions");
+            Directory.CreateDirectory(sessions);
+            Directory.CreateDirectory(archive);
+            try
+            {
+                string first = Path.Combine(sessions, "first.jsonl");
+                string second = Path.Combine(sessions, "second.jsonl");
+                string started = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n";
+                string aborted = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"}}\n";
+                string completed = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
+                var offsets = new Dictionary<string, long>();
+                var states = new Dictionary<string, LightState>();
+                var updated = new Dictionary<string, DateTime>();
+                File.WriteAllText(first, started);
+                File.WriteAllText(second, started);
+                if (!BridgeApplicationContext.PollCodexSessions(sessions, offsets, states, updated) ||
+                    states[first] != LightState.Working || states[second] != LightState.Working)
+                    throw new InvalidOperationException("Session start detection failed.");
+
+                File.AppendAllText(first, aborted);
+                if (!BridgeApplicationContext.PollCodexSessions(sessions, offsets, states, updated) ||
+                    states[first] != LightState.Idle || states[second] != LightState.Working)
+                    throw new InvalidOperationException("Aborted session cleanup affected another task.");
+
+                // An interrupted permission wait must also stop counting as active.
+                states[first] = LightState.Waiting;
+                File.AppendAllText(first, aborted);
+                if (!BridgeApplicationContext.PollCodexSessions(sessions, offsets, states, updated) ||
+                    states[first] != LightState.Idle)
+                    throw new InvalidOperationException("Aborted waiting session cleanup failed.");
+
+                File.AppendAllText(first, started);
+                BridgeApplicationContext.PollCodexSessions(sessions, offsets, states, updated);
+                string archivedFile = Path.Combine(archive, "first.jsonl");
+                File.Move(first, archivedFile);
+                if (!BridgeApplicationContext.PollCodexSessions(sessions, offsets, states, updated) ||
+                    states.ContainsKey(first) || offsets.ContainsKey(first) || updated.ContainsKey(first) ||
+                    states[second] != LightState.Working)
+                    throw new InvalidOperationException("Archived session cleanup affected another task.");
+
+                File.Move(archivedFile, first);
+                if (!BridgeApplicationContext.PollCodexSessions(sessions, offsets, states, updated) ||
+                    states[first] != LightState.Working)
+                    throw new InvalidOperationException("Restored session was not monitored again.");
+                File.AppendAllText(first, completed);
+                File.AppendAllText(second, completed);
+                if (!BridgeApplicationContext.PollCodexSessions(sessions, offsets, states, updated) ||
+                    states[first] != LightState.Idle || states[second] != LightState.Idle ||
+                    BridgeApplicationContext.PollCodexSessions(sessions, offsets, states, updated))
+                    throw new InvalidOperationException("Normal completion or unchanged polling regressed.");
+
+                // An unavailable root is not proof that individual sessions were archived.
+                states[second] = LightState.Working;
+                if (BridgeApplicationContext.PollCodexSessions(Path.Combine(testRoot, "missing"),
+                    offsets, states, updated) || states[second] != LightState.Working)
+                    throw new InvalidOperationException("Unavailable session root cleared active state.");
+                File.Delete(first);
+                File.Delete(second);
+                if (!BridgeApplicationContext.PollCodexSessions(sessions, offsets, states, updated) ||
+                    states.Count != 0 || offsets.Count != 0 || updated.Count != 0)
+                    throw new InvalidOperationException("Removed session cleanup failed.");
+            }
+            finally
+            {
+                Directory.Delete(testRoot, true);
+            }
+        }
+
         private static int RunSelfTest(string outputPath)
         {
             try
@@ -910,6 +983,8 @@ namespace CodexStatusLight
                 turns.Clear();
                 if (BridgeApplicationContext.CalculateOverallState(turns) != LightState.Idle)
                     throw new InvalidOperationException("Idle aggregation failed.");
+
+                RunSessionCleanupSelfTest(Path.GetDirectoryName(Path.GetFullPath(outputPath)));
 
                 if (BridgeApplicationContext.DeviceCommandFor(LightState.Working, 1, false, true) != "THINKING" ||
                     BridgeApplicationContext.DeviceCommandFor(LightState.Working, 2, false, true) != "THINKING" ||
@@ -1734,15 +1809,38 @@ namespace CodexStatusLight
 
         private bool PollCodexSessions()
         {
-            bool changed = false;
             string root = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 ".codex", "sessions");
+            return PollCodexSessions(root, sessionOffsets, sessionStates, sessionUpdatedUtc);
+        }
+
+        internal static bool PollCodexSessions(
+            string root,
+            IDictionary<string, long> sessionOffsets,
+            IDictionary<string, LightState> sessionStates,
+            IDictionary<string, DateTime> sessionUpdatedUtc)
+        {
+            bool changed = false;
             if (!Directory.Exists(root)) return false;
 
             try
             {
                 string[] files = Directory.GetFiles(root, "*.jsonl", SearchOption.AllDirectories);
+                // Only reconcile after a successful full scan: a read failure must
+                // not turn a still-running session into an idle one.
+                var existingFiles = new HashSet<string>(files, StringComparer.OrdinalIgnoreCase);
+                foreach (string trackedFile in new List<string>(sessionOffsets.Keys))
+                {
+                    if (existingFiles.Contains(trackedFile)) continue;
+                    sessionOffsets.Remove(trackedFile);
+                    sessionUpdatedUtc.Remove(trackedFile);
+                    if (sessionStates.Remove(trackedFile))
+                    {
+                        changed = true;
+                        Log.Write("Removed archived or moved session state " + Path.GetFileName(trackedFile));
+                    }
+                }
                 DateTime cutoff = DateTime.UtcNow.AddDays(-1);
                 foreach (string file in files)
                 {
@@ -1794,7 +1892,8 @@ namespace CodexStatusLight
 
                             if (record.payload.type == "task_started")
                                 detectedState = LightState.Working;
-                            else if (record.payload.type == "task_complete")
+                            else if (record.payload.type == "task_complete" ||
+                                     record.payload.type == "turn_aborted")
                                 detectedState = LightState.Idle;
                             else if (record.payload.type == "custom_tool_call" &&
                                      !string.IsNullOrEmpty(record.payload.input) &&

@@ -1682,7 +1682,7 @@ namespace CodexStatusLight
                 {
                     if (systemSuspended)
                         return;
-                    RemoveStaleTurns();
+                    bool turnStateExpired = RemoveStaleTurns();
                     bool monitorCodex = string.Equals(
                         selectedPlatform,
                         IntegrationManager.CodexPlatform,
@@ -1693,7 +1693,7 @@ namespace CodexStatusLight
                         DateTime.UtcNow >= recentCursorCompletionUntilUtc;
                     if (cursorCompletionExpired)
                         recentCursorCompletionUntilUtc = DateTime.MinValue;
-                    bool logicalInputChanged = sessionStateExpired || cursorCompletionExpired;
+                    bool logicalInputChanged = turnStateExpired || sessionStateExpired || cursorCompletionExpired;
                     if (monitorCodex && DateTime.UtcNow >= nextSessionPollUtc)
                     {
                         nextSessionPollUtc = DateTime.UtcNow.AddSeconds(1);
@@ -1928,13 +1928,14 @@ namespace CodexStatusLight
             return changed;
         }
 
-        private void RemoveStaleTurns()
+        private bool RemoveStaleTurns()
         {
             DateTime cutoff = DateTime.UtcNow.AddMinutes(-30);
             var stale = new List<string>();
             foreach (KeyValuePair<string, TurnStatus> pair in turns)
                 if (pair.Value.LastUpdatedUtc < cutoff) stale.Add(pair.Key);
             foreach (string key in stale) turns.Remove(key);
+            return stale.Count > 0;
         }
 
         private bool RemoveStaleSessionStates()
